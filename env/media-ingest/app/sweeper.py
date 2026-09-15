@@ -1,52 +1,46 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from sqlalchemy import delete, select
 
-from .db import Chunk, Upload, utcnow
+from . import accounting, jobs
+from .db import Chunk, MergeJob, Upload, utcnow
 from .storage import Storage
 
 log = logging.getLogger("ingest.sweeper")
 
 
 def sweep_expired(session_factory, storage: Storage, now: datetime | None = None) -> list[str]:
-    """Expire uploads that never completed before their TTL. Removes chunk rows
-    and staging files; keeps the upload row so clients can see status=expired."""
+    """Expire uploads that never completed before their TTL. Removes chunk rows,
+    staging files and any still-queued job, and releases the byte reservation
+    exactly once. Sealed uploads are never expired and never release (their
+    bytes are now permanent 'used' capacity)."""
     now = now or utcnow()
+    expired: list[str] = []
     with session_factory() as s:
+        running = select(MergeJob.upload_id).where(MergeJob.status == jobs.RUNNING)
         rows = (
             s.execute(
                 select(Upload).where(
-                    Upload.status.in_(("uploading", "failed")),
+                    Upload.status.in_(("uploading", "failed", "queued")),
                     Upload.expires_at < now,
+                    Upload.id.not_in(running),
                 )
             )
             .scalars()
             .all()
         )
-        expired = [u.id for u in rows]
         for u in rows:
-            u.status = "expired"
-            u.error = "upload TTL exceeded before completion"
-            s.execute(delete(Chunk).where(Chunk.upload_id == u.id))
+            released = accounting.release_once(s, u)
+            if released:
+                u.status = "expired"
+                u.error = "upload TTL exceeded before completion"
+                jobs.cancel_queued(s, u.id)
+                s.execute(delete(Chunk).where(Chunk.upload_id == u.id))
+                expired.append(u.id)
         s.commit()
     for uid in expired:
         storage.remove_staging(uid)
     return expired
-
-
-def requeue_stale_merges(session_factory, queue, stale_seconds: int) -> int:
-    """Re-enqueue uploads stuck in 'merging' (worker crashed after claiming).
-    Duplicates are harmless — run_merge is idempotent and lock-guarded."""
-    cutoff = utcnow() - timedelta(seconds=stale_seconds)
-    with session_factory() as s:
-        ids = (
-            s.execute(select(Upload.id).where(Upload.status == "merging", Upload.updated_at < cutoff))
-            .scalars()
-            .all()
-        )
-    for uid in ids:
-        queue.enqueue(uid)
-    return len(ids)

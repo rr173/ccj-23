@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 import time
 import urllib.request
-import json
 
 
 def sha256_file(path, chunk_size):
@@ -23,11 +23,15 @@ def sha256_file(path, chunk_size):
 
 
 class Client:
-    def __init__(self, base):
+    def __init__(self, base, tenant_id, request_key=None):
         self.base = base.rstrip("/")
+        self.tenant_id = tenant_id
+        self.request_key = request_key
 
     def _req(self, method, path, body=None, headers=None):
-        r = urllib.request.Request(self.base + path, data=body, method=method, headers=headers or {})
+        h = {"X-Tenant-ID": self.tenant_id}
+        h.update(headers or {})
+        r = urllib.request.Request(self.base + path, data=body, method=method, headers=h)
         try:
             with urllib.request.urlopen(r) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")
@@ -35,10 +39,13 @@ class Client:
             return e.code, json.loads(e.read() or b"{}")
 
     def create_upload(self, size, chunk_size, total_chunks, expected_sha256):
+        headers = {"Content-Type": "application/json"}
+        if self.request_key:
+            headers["X-Idempotency-Key"] = self.request_key
         st, body = self._req("POST", "/uploads", json.dumps({
             "total_size": size, "chunk_size": chunk_size,
             "total_chunks": total_chunks, "expected_sha256": expected_sha256,
-        }).encode(), {"Content-Type": "application/json"})
+        }).encode(), headers)
         assert st == 201, body
         return body["upload_id"]
 
@@ -66,10 +73,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file")
     ap.add_argument("--api", default="http://localhost:8080")
+    ap.add_argument("--tenant", required=True, help="X-Tenant-ID")
+    ap.add_argument("--request-key", default=None,
+                    help="idempotency key (X-Idempotency-Key); defaults to file path")
     ap.add_argument("--chunk-size", type=int, default=8 * 1024 * 1024)
     args = ap.parse_args()
 
-    c = Client(args.api)
+    c = Client(args.api, args.tenant, args.request_key or f"upload:{args.file}")
     size = __import__("os").path.getsize(args.file)
     cs = args.chunk_size
     total = (size + cs - 1) // cs
