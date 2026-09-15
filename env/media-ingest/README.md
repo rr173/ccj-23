@@ -58,6 +58,74 @@ commit_used  +size   合并成功：与 release(-size) 同一事务，把预留�
 - worker 多进程 / 多线程安全：条件 `UPDATE … WHERE status='queued'` 配合行级写锁，同一上传不会被并发处理。
 - 策略版本快照在 upload 行上：策略变更只影响之后创建的上传。
 
+## 归档：保留期 / 法律保全 / 内容去重 / 可证明删除
+
+已封存对象（`archived_versions`）的生命周期由 `app/archive/` 子系统独立管理，接口前缀 `/archive`。
+
+### 版本化保留策略
+
+- `PUT /archive/tenants/{id}/policy` **追加**一条不可变策略版本 `{retention_seconds}`；`GET .../policies` 可查全部版本。
+- 封存（`PUT /archive/objects/{oid}/versions/{v}`，body 即对象字节）时把 `(policy_version, retention_seconds)` **快照到版本行**；旧对象永远按封存时的版本计算到期时间，策略更新只影响之后封存的对象。
+
+### 删除资格（明确返回阻止原因）
+
+`GET /archive/objects/{oid}/versions/{v}/eligibility` 返回 `eligible` 与全部 `blockers`，每条带 `reason`：
+
+| reason | 含义 |
+|---|---|
+| `retention` | 保留期未届满（附 `expires_at`、`remaining_seconds`、策略版本） |
+| `legal_hold` | 存在一项或多项生效法律保全（附全部 hold） |
+| `reference` | 仍有其他持久引用（pin）指向该版本 |
+
+已删除版本返回 `already_deleted`。`shared_content` 段单独说明物理内容被多少活动引用共享——它**不阻止逻辑删除**，只决定物理内容是否随本次删除清理。
+
+### 法律保全
+
+- `PUT /archive/objects/{oid}/holds/{key}`（body 可带 `reason`）：对象级、可叠加；保全跨过保留期到期时间仍然阻止删除。
+- `DELETE .../holds/{key}`：解除一项；**解除最后一项后对象才重新具备删除资格**。保全行只追加（`released_at`），历史不可销毁。
+
+### 内容去重引用
+
+- 物理内容按 SHA-256 内容寻址（`content_blobs` + `<data>/archive/content/ab/<sha256>`），字节相同的任意数量版本——**包括跨租户版本**——共享一份物理内容。
+- 每个 `(租户, 对象, 版本)` 的访问权限与生命周期互相隔离：下载严格按租户+版本鉴权；删除一个版本只释放它自己的那一个引用。
+- 引用计数只通过一条带条件的 `UPDATE ... WHERE state='active' AND refcount>0` 递减，并由版本行 `refs_released_at` 精确一次标记保护：并发/重复删除**不会把计数减成负数**；最后一个活动引用删除后 blob 进入 `pending_purge`，物理文件才允许清理。
+
+### 多阶段、崩溃安全、幂等的删除
+
+删除状态机（`archive_delete_ops`）每阶段独立事务落盘：
+
+```
+1. logical delete   版本 -> tombstoned（下载立即永久失效，不可复活）
+2. release refs     精确一次的条件递减；最后引用使 blob -> pending_purge
+3. purge+finalize   认领为 purging -> os.unlink（幂等）-> purged -> 出具删除证明
+```
+
+- 启动时 `ArchiveService.resume()` 自动续做：`purging` 的 blob 补做 unlink，未 finalized 的 op 从断点推进；无崩溃时是空操作。
+- 崩溃在逻辑删除之后 => 版本永远是 tombstone，**不会恢复下载**；崩溃在物理清理前后 => 共享内容只要还有活动引用就保持 `active`，**不会被误删**。
+- 删除支持 `X-Idempotency-Key`：并发或重复请求收敛到同一个 op，**只有一次引用变化、一份删除证明**；重复调用返回原证明（`replayed: true`）。
+
+### 删除证明（不可篡改、可查询）
+
+删除完成后生成 `deletion_certificates`：记录对象与内容哈希、**策略版本与保留期快照**、删除时保全/pin 状态、逻辑删除时间、物理清理结果（`purged` 或 `retained_shared` + 剩余引用数）。
+
+- 行只插入、不修改不删除；全局序号形成**哈希链**（每条记录的 `record_hash` 链接上一条），并用 HMAC-SHA256 签名（密钥 `ARCHIVE_PROOF_KEY`，生产必须覆盖）。
+- 查询：`GET /archive/certificates/{id}`、`GET /archive/objects/{oid}/versions/{v}/certificate`、`GET /archive/certificates`；响应自带 `chain_valid`，篡改任一行（内容/签名/顺序）即验证失败。
+
+### 归档相关 API（均需 `X-Tenant-ID`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| PUT | `/archive/tenants/{id}/policy` | 发布新保留策略版本 |
+| GET | `/archive/tenants/{id}/policy` / `/policies` | 当前 / 全部策略版本 |
+| PUT | `/archive/objects/{oid}/versions/{v}` | 封存指定版本（body=字节），快照当前策略 |
+| POST | `/archive/objects/{oid}/versions` | 封存下一个自增版本 |
+| GET | `/archive/objects/{oid}/versions/{v}` / `/content` | 元数据 / 下载（tombstone 与跨租户均 404） |
+| GET | `/archive/objects/{oid}/versions/{v}/eligibility` | 删除资格与逐条阻止原因 |
+| DELETE | `/archive/objects/{oid}/versions/{v}` | 幂等删除（可带 `X-Idempotency-Key`） |
+| PUT/DELETE/GET | `/archive/objects/{oid}/holds/{key}` [`/holds`] | 法律保全 放置/解除/列表 |
+| PUT/DELETE | `/archive/objects/{oid}/versions/{v}/pins/{key}` | 其他持久引用（第三类删除阻止项） |
+| GET | `/archive/certificates/...` | 删除证明查询与链校验 |
+
 ## 架构
 
 ```

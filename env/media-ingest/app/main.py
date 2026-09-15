@@ -14,6 +14,18 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from . import accounting, jobs, tenants
+from .archive.api import build_router as build_archive_router
+from .archive.models import (  # noqa: F401  (register archive tables on Base.metadata)
+    ArchiveAuditEvent,
+    ArchiveDeleteOp,
+    ArchivedVersion,
+    ArchivePolicy,
+    ContentBlob,
+    DeletionCertificate,
+    LegalHold,
+    ObjectPin,
+)
+from .archive.service import ArchiveService
 from .config import Settings
 from .db import (
     Chunk,
@@ -64,6 +76,19 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.settings = settings
     app.state.session_factory = sf
     app.state.storage = storage
+
+    # Archive subsystem: retention/holds/dedup/provable deletion over sealed
+    # objects. Physical blobs live in <data_dir>/archive/content.
+    archive = ArchiveService(
+        settings.database_url,
+        os.path.join(settings.data_dir, "archive"),
+        proof_key=settings.archive_proof_key,
+        init_schema=False,  # init_db above already created all tables
+    )
+    # Finish any delete interrupted by an abnormal exit before serving traffic.
+    archive.resume()
+    app.state.archive = archive
+    app.include_router(build_archive_router(archive))
 
     def require_tenant(x_tenant_id: str | None) -> str:
         if not x_tenant_id:

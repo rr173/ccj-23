@@ -20,9 +20,13 @@ class Settings:
     default_capacity_bytes: int = 100 * 1024 * 1024 * 1024  # 100 GiB
     default_max_parallel_merges: int = 2
     default_weight: int = 1
+    # HMAC key for tamper-evident deletion certificates. MUST be overridden with
+    # a stable secret in production: proofs remain verifiable across restarts
+    # only while the key does not change.
+    archive_proof_key: str = "dev-archive-proof-key-change-me"
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         return cls(
             data_dir=os.environ.get("DATA_DIR", cls.data_dir),
             database_url=os.environ.get("DATABASE_URL", cls.database_url),
@@ -37,4 +41,5 @@ class Settings:
                 os.environ.get("DEFAULT_MAX_PARALLEL_MERGES", str(cls.default_max_parallel_merges))
             ),
             default_weight=int(os.environ.get("DEFAULT_WEIGHT", str(cls.default_weight))),
+            archive_proof_key=os.environ.get("ARCHIVE_PROOF_KEY", cls.archive_proof_key),
         )
