@@ -1,0 +1,64 @@
+services:
+  api:
+    build: .
+    command: uvicorn app.main:build_app --factory --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql+psycopg://ingest:ingest@db:5432/ingest
+      REDIS_URL: redis://redis:6379/0
+      DATA_DIR: /data
+      UPLOAD_TTL_SECONDS: "86400"
+    volumes:
+      - ingest-data:/data
+    ports:
+      - "8080:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://ingest:ingest@db:5432/ingest
+      REDIS_URL: redis://redis:6379/0
+      DATA_DIR: /data
+      UPLOAD_TTL_SECONDS: "86400"
+      SWEEP_INTERVAL_SECONDS: "30"
+    volumes:
+      - ingest-data:/data   # shared with api: staging chunks in, sealed objects out
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # scale the merge layer independently: docker compose up -d --scale worker=3
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ingest
+      POSTGRES_PASSWORD: ingest
+      POSTGRES_DB: ingest
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingest"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ingest-data:
+  pg-data:
