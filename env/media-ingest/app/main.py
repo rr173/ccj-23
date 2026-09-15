@@ -40,6 +40,15 @@ from .db import (
     new_id,
     utcnow,
 )
+from .derive.api import build_router as build_derive_router
+from .derive.models import (  # noqa: F401  (register derivation tables on Base.metadata)
+    DerivationJob,
+    DerivationLedger,
+    DerivationProtection,
+    DerivationRequest,
+    DerivationSegment,
+)
+from .derive.service import DerivationService
 from .storage import Storage
 
 log = logging.getLogger("ingest.api")
@@ -89,6 +98,23 @@ def create_app(settings: Settings) -> FastAPI:
     archive.resume()
     app.state.archive = archive
     app.include_router(build_archive_router(archive))
+
+    # Derivation subsystem: new immutable versions assembled from pinned ranges
+    # of existing sealed versions. Staging lives in <data_dir>/derive and is
+    # never downloadable; results seal into the shared archive content store.
+    derive = DerivationService(
+        settings.database_url,
+        os.path.join(settings.data_dir, "derive"),
+        content_dir=os.path.join(settings.data_dir, "archive"),
+        default_capacity_bytes=settings.default_capacity_bytes,
+        lease_seconds=settings.derive_lease_seconds,
+        init_schema=False,  # init_db above already created all tables
+    )
+    # Finish published-but-unbilled jobs after a crash; the API is typically
+    # single-process so force-expire all stale worker leases too.
+    derive.resume(force=True)
+    app.state.derive = derive
+    app.include_router(build_derive_router(derive))
 
     def require_tenant(x_tenant_id: str | None) -> str:
         if not x_tenant_id:

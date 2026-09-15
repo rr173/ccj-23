@@ -126,6 +126,62 @@ commit_used  +size   合并成功：与 release(-size) 同一事务，把预留�
 | PUT/DELETE | `/archive/objects/{oid}/versions/{v}/pins/{key}` | 其他持久引用（第三类删除阻止项） |
 | GET | `/archive/certificates/...` | 删除证明查询与链校验 |
 
+## 派生配方：从封存版本拼接新的不可变对象
+
+已封存对象可以按一份**派生配方**（recipe）生成新的不可变封存版本，接口前缀 `/derive`，后台由独立进程 `python -m app.derive.worker` 推进（可横向扩缩容）。
+
+### 配方与归一化摘要
+
+配方是一个有序段列表，每段固定引用**同一租户**内一个对象的**固定版本**，选一个半开字节区间 `[start, end)`，并声明该区间字节的 SHA-256（摘要针对区间字节本身）：
+
+```json
+{
+  "segments": [
+    {"object_id": "a", "version": 1, "range": [0, 10], "sha256": "..."},
+    {"object_id": "b", "version": 3, "range": "5-25", "expected_sha256": "..."}
+  ]
+}
+```
+
+区间写法可以是 `[s,e]` / `{"start":s,"end":e}` / 字符串 `"s-e"`，段内字段顺序任意，摘要大小写不敏感，未知字段忽略。归一化后按排序键的紧凑 JSON 计算 SHA-256，得到**配方摘要** `recipe_digest`——语义相同但写法不同的配方得到同一个摘要；段顺序（决定拼接顺序）或区间不同则摘要不同。
+
+### 受理：整体原子、不泄露存在性
+
+`POST /derive/jobs`（必须带 `X-Tenant-ID` 与 `X-Idempotency-Key` 或 body 内 `request_key`，并指定 `output_object_id`）：
+
+- 幂等：同租户 + 同请求键 + **同配方摘要** → 返回同一个任务（`replayed: true`）；同键不同配方 → `409 request_key_reused_with_different_recipe`（附原任务 id 与原摘要）。
+- 受理在**单个写事务**内固定全部源版本：每段必须存在、属于本租户、处于 `active`（未进入删除流程）、区间不越界，且对区间字节现场重算的摘要必须与声明一致。任一不满足 → 整个请求拒绝，不留下任务、保护或容量记录。
+- 不存在的版本与**其他租户**的版本返回完全相同的 `source_not_found`，无法借此探测其他租户的对象是否存在；摘要不符为 `digest_mismatch`，区间越界为 `range_out_of_bounds`，已在删除流程为 `source_deleting`。
+- 同一事务写入：任务、每段状态（初始 `waiting`）、对每个**去重后**源版本的保护行、以及一条派生容量预留（`derivation_ledger` 的 `reserve`）。
+
+### 源版本保护与容量
+
+- 任务存续期间，每个源版本都带一个活动的 `derivation_protections` 行，它在归档删除资格里表现为 `reason: reference` 阻塞项，并列出引用它的 `job_id`；删除任一源版本会被阻止。终态（计费完成 / 取消 / 失败）一次性释放全部保护。
+- 派生字节在**成功发布前不计入已用容量**，只以预留存在；容量账目与上传链路同构：`reserve +size` →（取消/失败）`release -size` 一次，或（成功）`release -size` + `commit_used +size` 成对且只发生一次。容量上限复用租户策略的 `capacity_bytes`。
+
+### 状态与取消
+
+`GET /derive/jobs/{id}` 返回任务状态、结果坐标、每段状态（`waiting` / `processing` / `verified` / `failed`）与未完成段的 `blocked_reason`（等待 worker、等待前序段、取消请求、失败原因等），以及 `open_protections`。完成前结果对象在归档接口下载一律 404。
+
+`POST /derive/jobs/{id}/cancel`：排队中任务同步终止；处理中/拼接中任务在最近的安全边界终止。终态清理删除不可见暂存、只释放一次预留、释放全部保护。**已发布（含已计费）任务不可取消**。
+
+### 并发、发布一次、崩溃恢复
+
+- 领取即租约 + **fence 令牌**：条件 UPDATE 让同一任务只能被一个 worker 推进；worker 崩溃后租约过期可被重新领取，旧 worker 即使存活，其后续带旧 fence 的写入全部失效。
+- 处理状态机：`queued → processing → assembling → published → billed`。段文件与拼接文件都走 tmp+fsync+`os.replace`，已校验段重启后直接复用，不重复提取。
+- **发布与计费是两个事务**：先在一个事务内原子写入新的 `archived_versions` 行、内容 blob 引用计数并把任务置 `published`（此刻才可下载）；下一个事务把预留转成**一次**已用容量并释放保护。
+- 三个异常退出点（写完任意段后、全部拼接完未发布、发布后未确认计费）重启后均恢复一致：不重复发布（输出版本唯一）、不重复计费（`UNIQUE(job_id, event_type)`）、不留下永久保护或孤儿暂存。`resume(force=True)` 在 API 启动与 `python -m app.derive.worker --recover` 时执行。
+
+### 派生相关 API（均需 `X-Tenant-ID`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/derive/jobs` | 提交配方（头 `X-Idempotency-Key` 或 body `request_key`），整体受理 |
+| GET | `/derive/jobs/{id}` | 任务与每段状态/阻塞原因、保护数、结果坐标 |
+| GET | `/derive/jobs` | 列出本租户任务 |
+| POST | `/derive/jobs/{id}/cancel` | 取消排队/处理中任务；已发布 409 |
+| GET | `/derive/capacity` | 派生容量的预留/已用/上限 |
+
 ## 架构
 
 ```
@@ -192,6 +248,8 @@ pytest tests/ -q
 
 覆盖：同一租户并发逼近容量上限、跨进程容量竞争、幂等重放与参数冲突、中止/过期/封存各自且仅一次的容量变化、加权 3:1 调度且低权重不饥饿、单租户并行上限让其它租户继续运行、调低容量后对象仍可下载但新预留被拒、创建/入队/封存各阶段模拟崩溃后的恢复一致性、进程重启后的租约回收。
 
+派生（`tests/test_derive.py`，另含真实 `os._exit` 子进程场景 `tests/derive_crash_scenario.py`）：多源多区间按序拼接正确、等价配方同摘要（异序/异写法则不同）、请求键幂等重放与异方冲突、跨租户/摘要错/区间越界/删除中源整体拒绝且不留残余、任务期间删除任一源版本被 reference 原因阻止、多进程并发领取只发布一次且只计费一次、排队与处理中取消后暂存/预留/保护全部释放且已发布不可取消、三个异常退出点重启后输出/计费/保护一致、完成前不可下载且不计容量、HTTP 全流程语义。
+
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -201,6 +259,7 @@ pytest tests/ -q
 | `UPLOAD_TTL_SECONDS` | `86400` | 上传会话过期时间 |
 | `SWEEP_INTERVAL_SECONDS` | `30` | 清理器周期 |
 | `MERGE_LEASE_SECONDS` | `120` | 合并任务租约时长（worker 心跳续租，过期被回收） |
+| `DERIVE_LEASE_SECONDS` | `120` | 派生任务租约时长（fence 令牌 + 过期回收，同合并任务模型） |
 | `RETRY_BACKOFF_SECONDS` | `5` | 瞬时合并失败后的退避 |
 | `WORKER_THREADS` | `4` | 单个 worker 进程内的并行合并线程数 |
 | `MAX_TOTAL_CHUNKS` | `100000` | 单上传分片数上限 |

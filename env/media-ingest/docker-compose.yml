@@ -35,6 +35,22 @@ services:
     # scale the merge layer independently: docker compose up -d --scale worker=3
     # The durable DB queue + leases keep multiple worker processes safe.
 
+  derive-worker:
+    build: .
+    command: python -m app.derive.worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://ingest:ingest@db:5432/ingest
+      DATA_DIR: /data
+      DERIVE_LEASE_SECONDS: "120"
+    volumes:
+      - ingest-data:/data   # shared content tree: reads sources, publishes results
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # independent horizontal scaling: the claim/fence protocol guarantees a
+    # derivation job is advanced by exactly one process and published once.
+
   db:
     image: postgres:16-alpine
     environment:

@@ -201,7 +201,69 @@ class ArchiveService:
                     ],
                 }
             )
+
+        # Active derivation jobs pin exact source versions for the whole life
+        # of the task (acceptance -> billing/cancel/fail). A delete must fail
+        # while any job may still need the bytes; the blocker names the jobs.
+        # The derivation tables are optional: a standalone archive-only schema
+        # (subsystem tests, minimal deployments) simply has no such pins.
+        # NOTE: the existence probe must run on the session's OWN connection —
+        # opening a second pooled connection here would deadlock against the
+        # BEGIN IMMEDIATE write lock this session already holds on SQLite.
+        if self._has_table(s, "derivation_protections"):
+            from ..derive import models as dm
+
+            protections = list(
+                s.scalars(
+                    select(dm.DerivationProtection).where(
+                        dm.DerivationProtection.tenant_id == v.tenant_id,
+                        dm.DerivationProtection.object_id == v.object_id,
+                        dm.DerivationProtection.version == v.version,
+                        dm.DerivationProtection.released_at.is_(None),
+                    )
+                )
+            )
+            if protections:
+                blockers.append(
+                    {
+                        "reason": "reference",
+                        "detail": (
+                            f"{len(protections)} active derivation job(s) reference "
+                            "this version as a fixed source"
+                        ),
+                        "derivations": [
+                            {"job_id": p.job_id, "pinned_at": p.created_at}
+                            for p in protections
+                        ],
+                    }
+                )
         return blockers
+
+    def _has_table(self, s, table_name: str) -> bool:
+        """Schema-existence probe that reuses the session's connection (so it
+        cannot deadlock against the session's own write lock). Result is cached
+        per engine: the schema never disappears within a process."""
+        engine = s.bind
+        cache = getattr(self, "_table_presence", None)
+        if cache is None:
+            cache = self._table_presence = {}
+        key = (engine.url.render_as_string(hide_password=False), table_name)
+        if key in cache:
+            return cache[key]
+        conn = s.connection()
+        if engine.dialect.name == "sqlite":
+            row = conn.exec_driver_sql(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).first()
+        else:
+            row = conn.exec_driver_sql(
+                "SELECT 1 FROM information_schema.tables WHERE table_name=%s",
+                (table_name,),
+            ).first()
+        present = row is not None
+        cache[key] = present
+        return present
 
     # ---------------------------------------------------------------- policy
 

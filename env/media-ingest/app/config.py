@@ -11,6 +11,8 @@ class Settings:
     upload_ttl_seconds: int = 24 * 3600
     sweep_interval_seconds: float = 30.0
     merge_lease_seconds: int = 120
+    # Lease for derivation jobs (same crash/reclaim model as merge jobs).
+    derive_lease_seconds: float = 120.0
     retry_backoff_seconds: int = 5
     max_total_chunks: int = 100_000
     # Local merge process parallelism (per-tenant max_parallel_merges is enforced
@@ -33,6 +35,7 @@ class Settings:
             upload_ttl_seconds=int(os.environ.get("UPLOAD_TTL_SECONDS", str(cls.upload_ttl_seconds))),
             sweep_interval_seconds=float(os.environ.get("SWEEP_INTERVAL_SECONDS", str(cls.sweep_interval_seconds))),
             merge_lease_seconds=int(os.environ.get("MERGE_LEASE_SECONDS", str(cls.merge_lease_seconds))),
+            derive_lease_seconds=float(os.environ.get("DERIVE_LEASE_SECONDS", str(cls.derive_lease_seconds))),
             retry_backoff_seconds=int(os.environ.get("RETRY_BACKOFF_SECONDS", str(cls.retry_backoff_seconds))),
             max_total_chunks=int(os.environ.get("MAX_TOTAL_CHUNKS", str(cls.max_total_chunks))),
             worker_threads=int(os.environ.get("WORKER_THREADS", str(cls.worker_threads))),
